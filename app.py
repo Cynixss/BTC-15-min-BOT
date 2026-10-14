@@ -1,13 +1,18 @@
 """
-app.py: Live Bitcoin 15- and 30-minute action dashboard for Kalshi BTC Up/Down markets.
+app.py: Live Bitcoin dashboard for Kalshi's 15-minute BTC Up/Down market, with a TradingView live
+chart (1m / 3m / 5m / 15m / 1h), a 7-test LOCK call, and win/loss records.
 
 Read-only and keyless: it uses only public endpoints and never places orders.
   * Candles + live tick : Coinbase Exchange (primary), Binance.US / Binance (fallbacks)
-  * Contracts           : Kalshi public Trade API v2  GET /markets?series_ticker=KXBTC15M (and 30M)
+  * Contracts           : Kalshi public Trade API v2  GET /markets?series_ticker=KXBTC15M
 
 Kalshi resolves each window on CF Benchmarks' BRTI: YES if the 60-second average
 before the close is >= the 60-second average before the window opened. The
 "target" line is that opening reference (Kalshi's strike), editable by hand.
+
+LOCK: a call that passes seven tests (DATA, TIME, STRENGTH, LOCK, REVERSAL, EDGE, CHOP). The first
+lock in each market is the "original lock call"; it is logged with a +25% buy/sell plan and graded
+against Kalshi's settled result.
 
 WIN / LOSS: a call is a WIN when it matches Kalshi's own settled result for that market
 (result "yes" = UP won, "no" = DOWN won). Ties settle YES (UP), per the rule above.
@@ -19,7 +24,12 @@ Run locally:  streamlit run app.py
 from __future__ import annotations
 
 import html
+import json
 import math
+import os
+import tempfile
+import threading
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -29,14 +39,33 @@ import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
+try:
+    import streamlit.components.v1 as components
+except Exception:  # if unavailable, the TradingView chart is skipped and everything else still works
+    components = None
+
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-BASE_SECONDS = 900  # exchange candles are fetched at 15m and rolled up for longer windows
+BASE_SECONDS = 900  # the dashboard works on 15-minute candles (Kalshi's market length)
 OHLCV = ["open", "high", "low", "close", "volume"]
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-SERIES_DEFAULTS = {15: "KXBTC15M", 30: "KXBTC30M"}  # 30M ticker is a best guess; editable in the sidebar
+KALSHI_SERIES = "KXBTC15M"
 HISTORY_HOURS = 76  # ~300 fifteen-minute candles, the most the exchange APIs return
+
+# TradingView chart: label -> TradingView interval code ("60" = 1 hour)
+TV_INTERVALS = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "1h": "60"}
+TV_SYMBOL = "COINBASE:BTCUSD"
+LIVE_CHART_HEIGHT = 560
+
+# Lock call
+LOCK_BOOK_PATH = os.path.join(tempfile.gettempdir(), "btc_kalshi_lock_book.json")
+LOCK_COLOR = "#7b1fa2"
+DRIFT_SECS = 30  # REVERSAL test looks at how the price cushion changed over this long
+EROSION_SIGMA = 0.35  # ...and fails if it shrank by more than this many 1-sigma moves
+CHOP_MAX_CROSSES = 1  # CHOP test: max EMA crossovers in the last 10 closed candles
+CHOP_RANGE_MULT = 2.5  # CHOP test: last candle range vs the median of the previous 20
+LOCK_TESTS = ["DATA", "TIME", "STRENGTH", "LOCK", "REVERSAL", "EDGE", "CHOP"]
 HEADERS = {"User-Agent": "btc-15m-dashboard/1.0 (streamlit)"}
 HTTP_TIMEOUT = 10
 
@@ -50,7 +79,7 @@ TIMEZONES = ["UTC", "America/Chicago", "America/New_York", "America/Los_Angeles"
 
 @dataclass(frozen=True)
 class Spec:
-    """One Kalshi market length (15 or 30 minutes) and the series that trades it."""
+    """One Kalshi market length (15 minutes) and the series that trades it."""
     minutes: int
     series: str
 
@@ -126,23 +155,6 @@ def fetch_candles() -> tuple[pd.DataFrame, str]:
         except Exception as exc:  # network / HTTP / parse: try the next source
             errors.append(f"{name}: {exc}")
     raise RuntimeError(" | ".join(errors))
-
-
-def resample_candles(df15: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    """Roll 15-minute candles up to `minutes` (Coinbase has no 30m granularity).
-    Buckets align to :00/:30 UTC. The oldest bucket is dropped if incomplete; the newest
-    (still forming) bucket is kept."""
-    if minutes == BASE_SECONDS // 60:
-        return df15
-    per = minutes // (BASE_SECONDS // 60)
-    g = df15.resample(f"{minutes}min", label="left", closed="left")
-    out = g.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-    n = g["close"].count()
-    out, n = out[n > 0], n[n > 0]
-    if len(out) and n.iloc[0] < per:
-        out = out.iloc[1:]
-    out.index.name = df15.index.name
-    return out
 
 
 @st.cache_data(ttl=1, show_spinner=False)
@@ -465,8 +477,7 @@ def get_snapshot(spec: Spec, lookback: int, offset: float, rsi_ob: float, rsi_os
     """Candles + live tick + indicators + Kalshi markets for one interval. The network calls
     inside are cached and shared between visitors and tabs; the pandas work is cheap."""
     now = pd.Timestamp.now(tz="UTC")
-    raw15, candle_src = fetch_candles()  # raises if every exchange fails; caller handles it
-    raw = resample_candles(raw15, spec.minutes)
+    raw, candle_src = fetch_candles()  # raises if every exchange fails; caller handles it
     tick, tick_src = None, None
     try:
         tick, tick_src = fetch_ticker()
@@ -644,6 +655,377 @@ def debounce(slot: str, action: str, ticker: str | None, has_pos: bool) -> tuple
 
 
 # --------------------------------------------------------------------------- #
+# LOCK call: seven tests must ALL pass (DATA, TIME, STRENGTH, LOCK, REVERSAL, EDGE, CHOP)
+#
+# A lock is stricter than a BUY call: it only fires late in a market, when price is decisively
+# on one side of the target, has stayed there, and nothing in the data hints at a reversal.
+# The FIRST lock in each market is the "original lock call". It is logged once, with a +25%
+# (adjustable) buy/sell plan, and graded against Kalshi's settled result.
+# It is a rule-based filter, not a guarantee: the record shows how it really performs.
+# --------------------------------------------------------------------------- #
+@dataclass
+class LockRules:
+    min_p: float = 0.80  # STRENGTH: model chance the side needs
+    hold_secs: int = 10  # LOCK: how long STRENGTH + trend must hold without a break
+    window_secs: int = 300  # TIME: locks are only called in the last N seconds of the market
+    profit: float = 0.25  # target profit for the buy/sell plan
+
+
+@dataclass
+class LockResult:
+    side: str | None  # "yes" (UP) | "no" (DOWN) | None
+    tests: list  # [(name, ok, detail)] in LOCK_TESTS order
+    passed: bool
+    entry: int | None  # ask of the side right now (what a lock would buy at)
+    bid: int | None
+    p_side: float | None
+    sd: float | None
+
+
+def record_tick(k: int, ts: float, price: float) -> None:
+    """Keep ~2 minutes of live prices per interval for the REVERSAL drift check."""
+    t = st.session_state.setdefault(f"ticks_{k}", [])
+    t.append((ts, price))
+    while t and t[0][0] < ts - 120:
+        t.pop(0)
+
+
+def hold_seconds(k: int, ticker: str | None, side: str | None, ok: bool, now: float, gap: float) -> float:
+    """Seconds the condition has held without a break (a gap longer than `gap` resets it)."""
+    ss, key = st.session_state, f"lockhold_{k}"
+    h = ss.get(key)
+    if (not ok) or h is None or h["ticker"] != ticker or h["side"] != side or now - h["last"] > gap:
+        h = {"ticker": ticker, "side": side, "since": None, "last": now}
+    if ok and h["since"] is None:
+        h["since"] = now
+    h["last"] = now
+    ss[key] = h
+    return (now - h["since"]) if (ok and h["since"] is not None) else 0.0
+
+
+def evaluate_lock(spec: Spec, ctx: dict, cfg: dict, now_ts: float) -> LockResult:
+    ss, k = st.session_state, spec.minutes
+    snap, cur, q = ctx["snap"], ctx["cur"], ctx["quotes"]
+    df, a = snap["df"], snap["analysis"]
+    spot, target, secs_left = ctx["spot"], ctx["target"], ctx["secs_left"]
+    L, R = cfg["lock"], cfg["rules"]
+    closed = df[df["is_closed"]]
+
+    live = target is not None and secs_left is not None and secs_left > 0
+    side = p_side = sd = cushion = ask = bid = None
+    up = True
+    if live:
+        p_up, sd = model_prob_up(spot, target, secs_left, snap["sigma"], spec.seconds)
+        up = p_up >= 0.5
+        side, p_side = ("yes", p_up) if up else ("no", 1 - p_up)
+        cushion = (spot - target) if up else (target - spot)
+        ask, bid = q.get("yes_ask" if up else "no_ask"), q.get("yes_bid" if up else "no_bid")
+    label = _side_label(side) if side else "n/a"
+    opp = "DOWN" if up else "UP"
+    tests: list = []
+
+    # 1) DATA: every feed is live and the target is trustworthy
+    bad = []
+    if snap["tick_src"] is None:
+        bad.append("live price feed is down")
+    if len(closed) == 0 or ctx["now"] - closed.index[-1] > 2 * spec.delta + pd.Timedelta(seconds=120):
+        bad.append("candle feed is stale")
+    if a is None:
+        bad.append("not enough closed candles for the indicators")
+    if snap["kalshi_err"]:
+        bad.append("Kalshi data error")
+    elif cur is None:
+        bad.append("no open Kalshi market")
+    elif side and (ask is None or bid is None):
+        bad.append("no bid/ask quote for the side")
+    if ctx["tsrc"] not in ("Kalshi strike", "Manual"):
+        bad.append(f"target is '{ctx['tsrc']}' (need Kalshi's strike or a manual target)")
+    tests.append(("DATA", not bad, "prices, candles, Kalshi quotes and target all present" if not bad
+                  else "; ".join(bad)))
+
+    # 2) TIME: inside the lock window, with enough time left to act
+    win = L.window_secs * spec.minutes / 15
+    if secs_left is None:
+        ok_t, d = False, "no open market"
+    elif secs_left < R.min_secs:
+        ok_t, d = False, f"only {int(secs_left)}s left (need at least {R.min_secs}s)"
+    elif secs_left > win:
+        ok_t, d = False, f"{int(secs_left)}s left; locks are only called in the last {int(win)}s"
+    else:
+        ok_t, d = True, f"{int(secs_left)}s left (window {R.min_secs}s to {int(win)}s)"
+    tests.append(("TIME", ok_t, d))
+
+    # 3) STRENGTH: price decisively on one side of the target
+    if live:
+        ok_s = p_side >= L.min_p
+        d = (f"{label} model {p_side:.0%} (need {L.min_p:.0%}); BTC is {_usd(abs(cushion))} on the "
+             f"{'winning' if cushion >= 0 else 'losing'} side ({cushion / sd:+.2f}σ)")
+    else:
+        ok_s, d = False, "no target or market to measure against"
+    tests.append(("STRENGTH", ok_s, d))
+
+    # 4) LOCK: STRENGTH and trend have held without a break
+    trend_ok = a is not None and a.signal != opp
+    gap = max(5.0, 3.0 * float(cfg.get("fast_secs", 1)) + 2.0)
+    held = hold_seconds(k, cur["ticker"] if cur is not None else None, side, ok_s and trend_ok, now_ts, gap)
+    if a is not None and not trend_ok:
+        ok_l, d = False, f"trend says {opp}, against {label}"
+    elif not ok_s:
+        ok_l, d = False, "waiting for STRENGTH to pass and hold"
+    else:
+        ok_l, d = held >= L.hold_secs, f"held {held:.0f}s of the {L.hold_secs}s needed (trend agrees or is neutral)"
+    tests.append(("LOCK", ok_l, d))
+
+    # 5) REVERSAL: no sign the price is turning back
+    bad = []
+    if a is not None and live:
+        if (up and a.mismatch == -1) or (not up and a.mismatch == 1):
+            bad.append("PVT buyer/seller mismatch against the side")
+        r_ = closed.iloc[-1]
+        uw, lw = r_["upper_wick_ratio"], r_["lower_wick_ratio"]
+        if up and uw >= WICK_LONG and uw >= lw:
+            bad.append("long upper wick on the last closed candle (sellers)")
+        if (not up) and lw >= WICK_LONG and lw > uw:
+            bad.append("long lower wick on the last closed candle (buyers)")
+        ticks = ss.get(f"ticks_{k}", [])
+        older = [p for ts, p in ticks if ts <= now_ts - DRIFT_SECS]
+        if not older:
+            span = (now_ts - ticks[0][0]) if ticks else 0
+            bad.append(f"still building {DRIFT_SECS}s of price history ({span:.0f}s so far)")
+        else:
+            then = (older[-1] - target) if up else (target - older[-1])
+            erosion = (then - cushion) / sd
+            if erosion > EROSION_SIGMA:
+                bad.append(f"cushion shrank {erosion:.2f}σ in {DRIFT_SECS}s")
+    elif not live:
+        bad.append("no target or market to check")
+    else:
+        bad.append("no indicator data")
+    tests.append(("REVERSAL", not bad, "no PVT mismatch, no opposing wick, cushion not eroding" if not bad
+                  else "; ".join(bad)))
+
+    # 6) EDGE: the price on offer is worth paying
+    if live and ask is not None:
+        edge = p_side * 100 - ask
+        ok_e = edge >= R.min_edge and ask <= R.max_price
+        d = (f"ask {ask}¢ vs model {p_side:.0%} = edge {edge:+.0f}¢ "
+             f"(need {R.min_edge:+.0f}¢ or more, ask at most {R.max_price}¢)")
+    else:
+        ok_e, d = False, "no ask quoted"
+    tests.append(("EDGE", ok_e, d))
+
+    # 7) CHOP: a clean trend, not a sideways whipsaw
+    ind = closed.dropna(subset=["ema_21"])
+    if len(ind) < 22:
+        tests.append(("CHOP", False, "not enough closed candles to judge"))
+    else:
+        bad = []
+        spread = abs(ind["ema_spread_pct"].iloc[-1])
+        crosses = int((ind["ema_cross"].tail(10) != 0).sum())
+        rngs = ind["range"].tail(21)
+        med = float(rngs.iloc[:-1].median())
+        if spread < FLAT_SPREAD_PCT:
+            bad.append(f"EMAs nearly flat ({spread:.3f}% apart)")
+        if crosses > CHOP_MAX_CROSSES:
+            bad.append(f"{crosses} EMA crossovers in the last 10 candles")
+        if med > 0 and rngs.iloc[-1] > CHOP_RANGE_MULT * med:
+            bad.append(f"last candle range {rngs.iloc[-1] / med:.1f}x normal")
+        tests.append(("CHOP", not bad, f"EMAs {spread:.3f}% apart, {crosses} crossovers in 10 candles, "
+                      "range normal" if not bad else "; ".join(bad)))
+
+    return LockResult(side, tests, all(t[1] for t in tests), ask, bid, p_side, sd)
+
+
+def lock_plan(entry: int, profit: float) -> dict:
+    """Buy/sell levels for a contract that pays 100c if right. `profit` is a fraction (0.25 = +25%)."""
+    max_buy = math.floor(100 / (1 + profit) + 1e-9)  # highest entry that still earns `profit` at settlement
+    sell = math.ceil(entry * (1 + profit) - 1e-9)  # bid that is `profit` above the entry
+    return dict(entry=entry, max_buy=max_buy, sell=sell, early_ok=sell <= 99,
+                settle_ok=entry <= max_buy, settle_pct=(100 - entry) / entry * 100)
+
+
+class LockBook:
+    """Log of original lock calls, shared by every visitor. Thread-safe, and mirrored to a JSON
+    file so it survives script reruns (a full app restart or redeploy can still wipe it)."""
+
+    def __init__(self, path: str):
+        self.path, self._mu, self.rows = path, threading.Lock(), []
+        try:
+            with open(path) as fh:
+                self.rows = list(json.load(fh))
+        except Exception:
+            self.rows = []
+
+    def _save(self) -> None:
+        try:
+            with open(self.path, "w") as fh:
+                json.dump(self.rows[-2000:], fh)
+        except Exception:
+            pass
+
+    def get(self, ticker: str | None) -> dict | None:
+        with self._mu:
+            return next((dict(r) for r in self.rows if r["ticker"] == ticker), None)
+
+    def add(self, row: dict) -> bool:
+        with self._mu:
+            if any(r["ticker"] == row["ticker"] for r in self.rows):
+                return False  # only the ORIGINAL lock call per market is kept
+            self.rows.append(row)
+            self._save()
+            return True
+
+    def update_peak(self, ticker: str, bid: int | None) -> None:
+        if bid is None:
+            return
+        with self._mu:
+            for r in self.rows:
+                if r["ticker"] == ticker and r["result"] is None:
+                    if r.get("peak_bid") is None or bid > r["peak_bid"]:
+                        r["peak_bid"] = bid
+                        r["tp_hit"] = bool(r["tp_hit"] or bid >= r["sell"])
+                        self._save()
+
+    def settle(self, results: dict) -> None:
+        with self._mu:
+            changed = False
+            for r in self.rows:
+                if r["result"] is None and r["ticker"] in results:
+                    r["result"] = results[r["ticker"]]
+                    r["win"] = r["side"] == r["result"]
+                    r["pnl"] = (100 - r["entry"]) if r["win"] else -r["entry"]
+                    changed = True
+            if changed:
+                self._save()
+
+    def all(self) -> list[dict]:
+        with self._mu:
+            return [dict(r) for r in self.rows]
+
+
+@st.cache_resource
+def get_lock_book() -> LockBook:
+    return LockBook(LOCK_BOOK_PATH)
+
+
+def lock_settle(settled: pd.DataFrame | None) -> None:
+    """Grade pending lock calls whose market Kalshi has settled."""
+    if settled is None or settled.empty:
+        return
+    get_lock_book().settle(dict(zip(settled["ticker"], settled["result"])))
+
+
+def lock_track(spec: Spec, ctx: dict, cfg: dict, lk: LockResult) -> dict | None:
+    """Log the ORIGINAL lock call for the current market (first time all 7 tests pass) and keep
+    its peak bid up to date. Returns that market's lock row, if any."""
+    cur = ctx["cur"]
+    if cur is None:
+        return None
+    book, ticker = get_lock_book(), cur["ticker"]
+    if lk.passed and lk.entry is not None:
+        plan = lock_plan(lk.entry, cfg["lock"].profit)
+        book.add(dict(
+            ticker=ticker, minutes=spec.minutes, side=lk.side, entry=lk.entry, bid=lk.bid,
+            p_side=round(float(lk.p_side), 4), spot=round(float(ctx["spot"]), 2),
+            target=round(float(ctx["target"]), 2), secs_left=int(ctx["secs_left"]),
+            logged_at=pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S"),
+            close_time=cur["close_time"].strftime("%Y-%m-%d %H:%M:%S"),
+            profit=cfg["lock"].profit, max_buy=plan["max_buy"], sell=plan["sell"],
+            peak_bid=lk.bid, tp_hit=bool(lk.bid is not None and lk.bid >= plan["sell"]),
+            result=None, win=None, pnl=None))
+    row = book.get(ticker)
+    if row and row["result"] is None:
+        book.update_peak(ticker, ctx["quotes"].get("yes_bid" if row["side"] == "yes" else "no_bid"))
+        row = book.get(ticker)
+    return row
+
+
+def render_lock_panel(lk: LockResult, row: dict | None, ctx: dict, cfg: dict, spec: Spec) -> None:
+    """The 7-test checklist, plus the buy/sell plan for the ORIGINAL lock call in this market."""
+    n_ok = sum(1 for t in lk.tests if t[1])
+    with st.expander(f"🔒 Lock check: {n_ok}/7 tests pass" + ("  ·  LOCKED" if lk.passed else ""),
+                     expanded=True):
+        for name, ok, detail in lk.tests:
+            st.markdown(f"{'✅' if ok else '❌'} **{name}** — {detail}")
+        if row is None:
+            st.caption("When all 7 pass, the lock call appears here with its buy/sell plan and is saved to "
+                       "the record below.")
+            return
+        profit = row.get("profit", cfg["lock"].profit)
+        pl = lock_plan(row["entry"], profit)
+        pct = int(round(profit * 100))
+        label = _side_label(row["side"])
+        st.markdown(f"**Original lock call:** {label} at {row['logged_at'][11:]} UTC, "
+                    f"{row['secs_left']}s before the close, model {row['p_side']:.0%}.")
+        lines = [f"**BUY** at the ask: **{row['entry']}¢** (about {row['entry']}% implied). "
+                 f"Don't pay more than **{pl['max_buy']}¢** if you want +{pct}% at settlement."]
+        if pl["early_ok"]:
+            lines.append(f"**SELL for +{pct}%:** place the sell when the {label.split()[0]} bid reaches "
+                         f"**{pl['sell']}¢** (entry × {1 + profit:.2f}).")
+        else:
+            lines.append(f"**SELL for +{pct}%:** not possible by selling early (needs {pl['sell']}¢, above "
+                         f"the 99¢ cap). Holding to settlement pays at most {100 - row['entry']}¢ "
+                         f"(+{pl['settle_pct']:.0f}%).")
+        lines.append(f"**If the bid never reaches the target:** hold to settlement. It pays 100¢ if right "
+                     f"(+{pl['settle_pct']:.0f}%) and 0¢ if wrong (−100%).")
+        closes = pd.Timestamp(row["close_time"], tz="UTC")
+        left = (closes - ctx["now"]).total_seconds()
+        hold = (f"**HOLD** until the bid hits {pl['sell']}¢ or the market closes at "
+                f"{closes.tz_convert(cfg['tz']):%H:%M} ({cfg['tz']}), at most {max(int(left), 0) // 60}:"
+                f"{max(int(left), 0) % 60:02d} from now ({row['secs_left']}s from the lock). "
+                f"Exit early if the dashboard calls SELL (your side drops below "
+                f"{int(cfg['rules'].sell_below * 100)}%).") if row["result"] is None else \
+            f"Market settled **{row['result'].upper()}**: this lock was a **{'WIN' if row['win'] else 'LOSS'}** " \
+            f"({row['pnl']:+d}¢ per contract if held to settlement)."
+        lines.append(hold)
+        for ln in lines:
+            st.markdown(f"- {ln}")
+        mine = "yes_bid" if row["side"] == "yes" else "no_bid"
+        st.caption(f"Bid now {_c(ctx['quotes'].get(mine))}¢ · peak bid since the lock {_c(row.get('peak_bid'))}¢ · "
+                   f"+{pct}% target {'reached' if row['tp_hit'] else 'not reached yet'} · before fees. "
+                   "Hold time is a deadline, not a forecast: nothing says how long the bid takes to get there.")
+
+
+def render_lock_record(spec: Spec, cfg: dict) -> None:
+    """Win/loss record of ORIGINAL lock calls, graded by Kalshi's settled result."""
+    st.markdown("**🔒 Original lock call record** (graded by Kalshi's settled result; shared by everyone "
+                "using this app)")
+    rows = [r for r in get_lock_book().all() if r["minutes"] == spec.minutes]
+    done = [r for r in rows if r["win"] is not None]
+    wins = sum(1 for r in done if r["win"])
+    _metric_row(wins, len(done) - wins)
+    pending = sum(1 for r in rows if r["result"] is None)
+    hit = sum(1 for r in done if r["tp_hit"])
+    pnl_hold = sum(r["pnl"] for r in done)
+    pnl_tp = sum((r["sell"] - r["entry"]) if r["tp_hit"] else r["pnl"] for r in done)
+    pct = int(round(cfg["lock"].profit * 100))
+    if rows:
+        st.caption(f"{len(rows)} lock calls · {pending} awaiting settlement · +{pct}% target reached on "
+                   f"{hit} of {len(done)} settled · P&L per 1-contract: hold to settlement {pnl_hold:+d}¢, "
+                   f"take profit at target {pnl_tp:+d}¢ (before fees)")
+        with st.expander(f"Lock call log ({len(rows)})"):
+            t = pd.DataFrame(rows)
+            show = pd.DataFrame({
+                f"Locked ({cfg['tz']})": pd.to_datetime(t["logged_at"], utc=True).dt.tz_convert(cfg["tz"]).dt.strftime("%m-%d %H:%M:%S"),
+                "Side": t["side"].map({"yes": "UP", "no": "DOWN"}), "Buy ¢": t["entry"], "Model": t["p_side"].map("{:.0%}".format),
+                "Secs left": t["secs_left"], "Sell target ¢": t["sell"], "Peak bid ¢": t["peak_bid"],
+                f"+{pct}% hit": t["tp_hit"].map({True: "yes", False: "no"}),
+                "Kalshi": t["result"].fillna("pending").str.upper(),
+                "Result": t["win"].map({True: "WIN", False: "LOSS"}).fillna("—"), "P&L ¢": t["pnl"],
+            }).iloc[::-1]
+            st.dataframe(show, hide_index=True, width="stretch")
+            st.download_button("Download lock record (CSV)", t.to_csv(index=False).encode(),
+                               file_name=f"btc_{spec.minutes}m_lock_record.csv", mime="text/csv",
+                               key=f"dl_lock_{spec.minutes}")
+        st.caption("This log lives on the app server while the app runs. Streamlit Cloud can wipe it on a "
+                   "restart or redeploy, so download the CSV to keep a copy. Locks are only logged while "
+                   "the page is open somewhere.")
+    else:
+        st.caption("No lock calls yet. A lock is rare by design; each one is logged here once, graded when "
+                   "Kalshi settles the market.")
+
+
+# --------------------------------------------------------------------------- #
 # Win / loss records
 #
 # A WIN is a call that matches how KALSHI settled the market: result "yes" = UP won,
@@ -672,378 +1054,4 @@ def signal_record(df: pd.DataFrame, settled: pd.DataFrame | None, spec: Spec,
     sig = signal_series(df, rsi_ob, rsi_os)
     if settled is not None and not settled.empty:
         source = "Kalshi settled results"
-        out = pd.DataFrame({
-            "window_start": settled["close_time"] - spec.delta,
-            "outcome": settled["result"].map({"yes": "UP", "no": "DOWN"}),
-            "ticker": settled["ticker"],
-        })
-    else:
-        source = "Exchange candles (estimate: close >= open)"
-        c = df[df["is_closed"]]
-        out = pd.DataFrame({"window_start": c.index,
-                            "outcome": np.where(c["close"] >= c["open"], "UP", "DOWN"),
-                            "ticker": ""})
-    out = out.dropna(subset=["outcome"]).reset_index(drop=True)
-    out["signal"] = sig.reindex(out["window_start"] - spec.delta).to_numpy()
-    out = out[out["signal"].notna()]  # windows older than the loaded candles can't be graded
-    called = out[out["signal"].isin(["UP", "DOWN"])].copy()
-    called["win"] = called["signal"] == called["outcome"]
-    wins = int(called["win"].sum())
-    return dict(rows=called, wins=wins, losses=len(called) - wins, n_windows=len(out),
-                n_none=len(out) - len(called), source=source,
-                up_rate=float((out["outcome"] == "UP").mean()) if len(out) else float("nan"))
-
-
-def ledger_log(kind: str, minutes: int, ticker: str, side: str, entry, replace: bool = False) -> None:
-    """Record a BOT call or a ME position once per market."""
-    rows = st.session_state.setdefault("ledger", [])
-    for r in rows:
-        if r["kind"] == kind and r["ticker"] == ticker:
-            if replace and r["result"] is None:
-                r["side"], r["entry"] = side, entry
-            return
-    rows.append(dict(kind=kind, minutes=minutes, ticker=ticker, side=side, entry=entry,
-                     logged_at=pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S"),
-                     result=None, win=None, pnl=None))
-
-
-def ledger_mark_sold(kind: str, ticker: str) -> None:
-    """You exited early, so Kalshi's settlement isn't your result; keep it out of the W/L count."""
-    for r in st.session_state.get("ledger", []):
-        if r["kind"] == kind and r["ticker"] == ticker and r["result"] is None:
-            r["result"] = "SOLD"
-
-
-def ledger_settle(settled: pd.DataFrame | None) -> None:
-    """Grade every pending row whose market Kalshi has settled."""
-    if settled is None or settled.empty:
-        return
-    res = dict(zip(settled["ticker"], settled["result"]))
-    for r in st.session_state.get("ledger", []):
-        if r["result"] is None and r["ticker"] in res:
-            r["result"] = res[r["ticker"]]
-            r["win"] = r["side"] == r["result"]
-            e = r["entry"]
-            r["pnl"] = None if e is None else ((100 - e) if r["win"] else -e)
-
-
-def ledger_stats(kind: str, minutes: int) -> dict:
-    mine = [r for r in st.session_state.get("ledger", [])
-            if r["kind"] == kind and r["minutes"] == minutes]
-    done = [r for r in mine if r["win"] is not None]
-    wins = sum(1 for r in done if r["win"])
-    return dict(rows=mine, wins=wins, losses=len(done) - wins,
-                pending=sum(1 for r in mine if r["result"] is None),
-                sold=sum(1 for r in mine if r["result"] == "SOLD"),
-                pnl=sum(r["pnl"] for r in done if r["pnl"] is not None))
-
-
-# --------------------------------------------------------------------------- #
-# Target resolution (Kalshi strike, fallback estimate, or manual override)
-# --------------------------------------------------------------------------- #
-def resolve_target(cur: pd.Series | None, df: pd.DataFrame,
-                   spec: Spec) -> tuple[float | None, str, str | None]:
-    ss, k = st.session_state, spec.minutes
-    ticker = cur["ticker"] if cur is not None else None
-    note = None
-    if ss.get(f"use_manual_target_{k}") and float(ss.get(f"manual_target_{k}") or 0) > 0:
-        if ss.get(f"manual_target_ticker_{k}") == ticker:
-            return float(ss[f"manual_target_{k}"]), "Manual", None
-        note = "Your manual target was for an earlier market and is ignored. Re-enter it for this one."
-    if cur is not None and pd.notna(cur["strike"]):
-        return float(cur["strike"]), "Kalshi strike", note
-    if cur is not None:
-        start = cur["close_time"] - spec.delta
-        if start in df.index:
-            return float(df.at[start, "open"]), f"Estimated ({spec.minutes}m candle open)", note
-    return None, "Unavailable", note
-
-
-def _int_or_none(v):
-    return int(v) if pd.notna(v) else None
-
-
-def get_context(cfg: dict, spec: Spec) -> dict | None:
-    """Everything a UI fragment needs, or None (after showing an error)."""
-    try:
-        snap = get_snapshot(spec, cfg["lookback"], cfg["offset"], cfg["rsi_ob"], cfg["rsi_os"])
-    except Exception as exc:
-        st.error(f"Could not load candle data from any exchange. {exc}")
-        return None
-    now = pd.Timestamp.now(tz="UTC")
-    cur = None
-    if snap["markets"] is not None:
-        live = snap["markets"][snap["markets"]["close_time"] > now]
-        if not live.empty:
-            cur = live.iloc[0]
-    target, tsrc, tnote = resolve_target(cur, snap["df"], spec)
-    quotes = {k: _int_or_none(cur[k]) for k in ("yes_bid", "yes_ask", "no_bid", "no_ask")} if cur is not None else {}
-    secs_left = (cur["close_time"] - now).total_seconds() if cur is not None else None
-    return dict(snap=snap, now=now, cur=cur, target=target, tsrc=tsrc, tnote=tnote,
-                quotes=quotes, secs_left=secs_left, spot=snap["spot"])
-
-
-# --------------------------------------------------------------------------- #
-# Chart
-# --------------------------------------------------------------------------- #
-def build_chart(d: pd.DataFrame, rsi_ob: float, rsi_os: float, tz: str,
-                target: float | None, tsrc: str) -> go.Figure:
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.025,
-                        row_heights=[0.50, 0.17, 0.17, 0.16])
-    x = d.index
-
-    # Row 1: price + EMAs + crossover markers + TARGET line
-    fig.add_trace(go.Candlestick(
-        x=x, open=d["open"], high=d["high"], low=d["low"], close=d["close"], name="BTC-USD",
-        increasing_line_color=GREEN, decreasing_line_color=RED), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x, y=d["ema_9"], name="EMA 9",
-                             line=dict(color=AMBER, width=1.6)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x, y=d["ema_21"], name="EMA 21",
-                             line=dict(color=BLUE, width=1.6)), row=1, col=1)
-    if target is not None:
-        fig.add_trace(go.Scatter(
-            x=[x[0], x[-1]], y=[target, target], mode="lines", name=f"Target ({tsrc})",
-            line=dict(color="#ffffff", width=2, dash="dash"),
-            hovertemplate=f"Target ${target:,.2f}<extra></extra>"), row=1, col=1)
-    bull, bear = d[d["ema_cross"] == 1], d[d["ema_cross"] == -1]
-    fig.add_trace(go.Scatter(x=bull.index, y=bull["low"] * 0.9993, mode="markers",
-                             name="Bullish cross", marker=dict(symbol="triangle-up", size=11, color=GREEN)),
-                  row=1, col=1)
-    fig.add_trace(go.Scatter(x=bear.index, y=bear["high"] * 1.0007, mode="markers",
-                             name="Bearish cross", marker=dict(symbol="triangle-down", size=11, color=RED)),
-                  row=1, col=1)
-
-    # Row 2: RSI
-    fig.add_trace(go.Scatter(x=x, y=d["rsi_14"], name="RSI 14",
-                             line=dict(color="#ab47bc", width=1.6)), row=2, col=1)
-    fig.add_hrect(y0=rsi_os, y1=rsi_ob, fillcolor="gray", opacity=0.08, line_width=0, row=2, col=1)
-    fig.add_hline(y=rsi_ob, line_dash="dash", line_color=RED, line_width=1, row=2, col=1)
-    fig.add_hline(y=rsi_os, line_dash="dash", line_color=GREEN, line_width=1, row=2, col=1)
-
-    # Row 3: PVT + signal line + mismatch markers
-    fig.add_trace(go.Scatter(x=x, y=d["pvt"], name="PVT",
-                             line=dict(color="#26c6da", width=1.6)), row=3, col=1)
-    fig.add_trace(go.Scatter(x=x, y=d["pvt_signal"], name="PVT signal (EMA 9)",
-                             line=dict(color=AMBER, width=1.2, dash="dot")), row=3, col=1)
-    mb, ms = d[d["pvt_mismatch"] == 1], d[d["pvt_mismatch"] == -1]
-    fig.add_trace(go.Scatter(x=mb.index, y=mb["pvt"], mode="markers", name="Bullish mismatch",
-                             marker=dict(symbol="diamond", size=8, color=GREEN)), row=3, col=1)
-    fig.add_trace(go.Scatter(x=ms.index, y=ms["pvt"], mode="markers", name="Bearish mismatch",
-                             marker=dict(symbol="diamond", size=8, color=RED)), row=3, col=1)
-
-    # Row 4: wick distances in USD (upper = sell rejection above zero, lower = buy defense below)
-    fig.add_trace(go.Bar(x=x, y=d["upper_wick"], name="Upper wick $", marker_color=RED,
-                         hovertemplate="$%{y:,.2f}"), row=4, col=1)
-    fig.add_trace(go.Bar(x=x, y=-d["lower_wick"], name="Lower wick $", marker_color=GREEN,
-                         customdata=d["lower_wick"], hovertemplate="$%{customdata:,.2f}"), row=4, col=1)
-
-    fig.update_layout(
-        height=860, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
-        barmode="relative", xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-    )
-    fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
-    fig.update_yaxes(title_text="RSI", range=[0, 100], row=2, col=1)
-    fig.update_yaxes(title_text="PVT", row=3, col=1)
-    fig.update_yaxes(title_text="Wick $", row=4, col=1)
-    fig.update_xaxes(title_text=f"Time ({tz})", row=4, col=1)
-    return fig
-
-
-# --------------------------------------------------------------------------- #
-# UI sections
-# --------------------------------------------------------------------------- #
-ACTION_COLORS = {"BUY UP": "#1b9e5a", "BUY DOWN": "#1e6fd9", "WAIT": "#6b7280",
-                 "HOLD": "#d98e04", "SELL": "#d32f2f"}
-
-
-def render_banner(title: str, subtitle: str, color: str, footer: str = "") -> None:
-    foot = (f'<div style="font-size:.9rem;margin-top:8px;opacity:.85">{html.escape(footer)}</div>'
-            if footer else "")
-    st.markdown(
-        f'<div style="padding:18px 24px;border-radius:14px;background:{color};color:#fff;">'
-        f'<div style="font-size:2.4rem;font-weight:800;line-height:1.1">{html.escape(title)}</div>'
-        f'<div style="font-size:1.1rem;margin-top:6px">{html.escape(subtitle)}</div>{foot}</div>',
-        unsafe_allow_html=True)
-
-
-def render_trend_breakdown(a: Analysis | None) -> None:
-    st.subheader("Trend & pressure breakdown")
-    if a is None:
-        st.info("Not enough closed candles yet.")
-        return
-    st.caption(f"{a.headline} · last closed candle {a.candle_time:%H:%M} UTC")
-    for line in a.findings:
-        st.markdown(f"- {line}")
-    if a.cautions:
-        st.warning("**Caution flags**\n\n" + "\n".join(f"- {c}" for c in a.cautions))
-
-
-def render_kalshi(ctx: dict, tz: str, spec: Spec) -> None:
-    st.subheader(f"Kalshi {spec.minutes}-minute BTC contracts")
-    snap, cur = ctx["snap"], ctx["cur"]
-    if snap["kalshi_err"]:
-        st.info(f"Kalshi market data is unavailable right now ({snap['kalshi_err'][:80]}). "
-                "Charts and trend analysis still work, but trade calls need Kalshi prices.")
-        return
-    if cur is None:
-        st.info(f"No open {spec.series} market found. A new one usually lists at the next "
-                f"{spec.minutes}-minute mark. If this never changes, check the series ticker in the sidebar "
-                "(Kalshi may not list this market length).")
-        return
-    mins, secs = divmod(max(int(ctx["secs_left"]), 0), 60)
-    st.markdown(f"`{cur['ticker']}` · closes in **{mins}:{secs:02d}**  \n{cur['title']}")
-    q = ctx["quotes"]
-    c1, c2 = st.columns(2)
-    c1.metric("UP / YES", f"{_c(q['yes_ask'])}¢ ask", f"bid {_c(q['yes_bid'])}¢", delta_color="off")
-    c2.metric("DOWN / NO", f"{_c(q['no_ask'])}¢ ask", f"bid {_c(q['no_bid'])}¢", delta_color="off")
-
-    live = snap["markets"][snap["markets"]["close_time"] > ctx["now"]]
-    show = pd.DataFrame({
-        "Ticker": live["ticker"],
-        "Strike": live["strike"].map(lambda v: _usd(v) if pd.notna(v) else "—"),
-        f"Closes ({tz})": live["close_time"].dt.tz_convert(tz).dt.strftime("%H:%M"),
-        "YES bid/ask": live.apply(lambda r: f"{_c(r['yes_bid'])}/{_c(r['yes_ask'])}¢", axis=1),
-        "NO bid/ask": live.apply(lambda r: f"{_c(r['no_bid'])}/{_c(r['no_ask'])}¢", axis=1),
-        "Volume": live["volume"],
-    })
-    with st.expander(f"All open markets ({len(live)})"):
-        st.dataframe(show, hide_index=True, width="stretch")
-
-
-def live_top(cfg: dict, spec: Spec) -> None:
-    """Action banner + live metrics. Re-runs every second."""
-    k = spec.minutes
-    ctx = get_context(cfg, spec)
-    if ctx is None:
-        return
-    ss, cur, snap = st.session_state, ctx["cur"], ctx["snap"]
-    ticker = cur["ticker"] if cur is not None else None
-    ss[f"cur_ticker_{k}"], ss[f"quotes_{k}"] = ticker, ctx["quotes"]  # read by the position buttons
-
-    # A position only lives until its own market closes
-    pos_key = f"position_{k}"
-    pos, expired = ss.get(pos_key), False
-    if pos and pos.get("ticker") != ticker:
-        ss[pos_key], pos, expired = None, None, True
-
-    dec = decide(snap["analysis"], ctx["spot"], ctx["target"], ctx["secs_left"], snap["sigma"],
-                 ctx["quotes"], pos, cfg["rules"], spec.seconds)
-    confirmed, n, need = debounce(f"ui{k}", dec.action, ticker, pos is not None)
-
-    if confirmed:
-        title, subtitle, color = dec.title, dec.subtitle, ACTION_COLORS[dec.action]
-        if dec.action in ("BUY UP", "BUY DOWN") and ticker:  # log it so it can be graded at settlement
-            side = "yes" if dec.action == "BUY UP" else "no"
-            ledger_log("BOT", k, ticker, side, ctx["quotes"].get("yes_ask" if side == "yes" else "no_ask"))
-    else:  # signal is forming but hasn't held for enough consecutive seconds
-        fallback = "HOLD" if pos else "WAIT"
-        title = fallback
-        subtitle = f"{dec.title} signal forming, confirming ({n}/{need}s)"
-        color = ACTION_COLORS[fallback]
-    pos_txt = ("You hold " + _side_label(pos["side"]) +
-               (f" @ {pos['entry']}¢" if pos.get("entry") is not None else "")) if pos else "No position set"
-    render_banner(title, subtitle, color, footer=f"{pos_txt} · updated {ctx['now']:%H:%M:%S} UTC")
-    if expired:
-        st.caption("Your previous position's market has closed, so it was cleared.")
-
-    with st.expander("Why this call", expanded=True):
-        for line in dec.reasons:
-            st.markdown(f"- {line}")
-
-    # ---- metrics ----
-    m1, m2, m3, m4, m5 = st.columns(5)
-    spot, target = ctx["spot"], ctx["target"]
-    m1.metric("BTC live", _usd(spot))
-    m2.metric(f"Target ({ctx['tsrc']})", _usd(target) if target is not None else "n/a")
-    if target is not None and dec.sd:
-        m3.metric("Spot − target", f"{spot - target:+,.2f}", f"{(spot - target) / dec.sd:+.2f}σ", delta_color="off")
-    else:
-        m3.metric("Spot − target", "n/a")
-    m4.metric("Model P(UP)", f"{dec.p_up:.0%}" if dec.p_up is not None else "n/a",
-              f"YES ask {_c(ctx['quotes'].get('yes_ask'))}¢" if ctx["quotes"] else None, delta_color="off")
-    if ctx["secs_left"] is not None:
-        mins, secs = divmod(max(int(ctx["secs_left"]), 0), 60)
-        m5.metric("Market closes in", f"{mins}:{secs:02d}")
-    else:
-        m5.metric("Market closes in", "n/a")
-
-    if ctx["tnote"]:
-        st.warning(ctx["tnote"])
-    if ctx["tsrc"].startswith("Estimated"):
-        st.caption(f"Kalshi's strike wasn't in the API response, so the target is estimated from the "
-                   f"{k}-minute candle open. Check it against Kalshi and use the manual override if it's off.")
-    if snap["tick_src"] is None:
-        st.warning("Live price feed unavailable; using the last candle close instead.")
-    if ctx["now"] - snap["df"].index[-1] > pd.Timedelta(minutes=20 + k):
-        st.warning("The newest candle is more than 20 minutes old. The data feed may be lagging.")
-
-
-def chart_panel(cfg: dict, spec: Spec) -> None:
-    """Interactive chart. Re-runs every few seconds (a full redraw each second is too heavy)."""
-    ctx = get_context(cfg, spec)
-    if ctx is None:
-        return
-    df = ctx["snap"]["df"]
-    view = df.tail(cfg["n_candles"]).copy()
-    view.index = view.index.tz_convert(cfg["tz"]).tz_localize(None)  # wall-clock times in chosen tz
-    st.plotly_chart(build_chart(view, cfg["rsi_ob"], cfg["rsi_os"], cfg["tz"], ctx["target"], ctx["tsrc"]),
-                    width="stretch", key=f"chart_{spec.minutes}")
-    st.caption(f"{spec.minutes}-minute candles: {ctx['snap']['candle_src']} · live tick: "
-               f"{ctx['snap']['tick_src'] or 'n/a'} · "
-               "the rightmost candle is still forming; trend signals use the last closed candle.")
-
-
-def live_side(cfg: dict, spec: Spec) -> None:
-    ctx = get_context(cfg, spec)
-    if ctx is None:
-        return
-    render_trend_breakdown(ctx["snap"]["analysis"])
-    st.divider()
-    render_kalshi(ctx, cfg["tz"], spec)
-
-
-def _metric_row(wins: int, losses: int) -> None:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Wins", wins)
-    c2.metric("Losses", losses)
-    c3.metric("W/L ratio", fmt_ratio(wins, losses))
-    c4.metric("Win rate", fmt_rate(wins, losses))
-
-
-def record_panel(cfg: dict, spec: Spec) -> None:
-    """Win/loss records graded against Kalshi's settled results."""
-    k = spec.minutes
-    ctx = get_context(cfg, spec)
-    if ctx is None:
-        return
-    settled, serr = None, None
-    try:
-        settled = fetch_kalshi_settled(spec.series, HISTORY_HOURS)
-    except Exception as exc:
-        serr = f"{type(exc).__name__}: {exc}"
-    ledger_settle(settled)
-
-    st.subheader(f"Win / loss record · {k}-minute")
-    st.caption("A win means your call matched Kalshi's settled result: UP wins if the 60-second BRTI average "
-               f"before the close is at least the one before the {k}-minute window opened (ties go to UP), "
-               "otherwise DOWN wins.")
-    if serr:
-        st.info(f"Kalshi's settled results are unavailable right now ({serr[:80]}).")
-
-    # ---- 1) trend signal replayed over windows Kalshi already settled ----
-    rec = signal_record(ctx["snap"]["df"], settled, spec, cfg["rsi_ob"], cfg["rsi_os"])
-    st.markdown(f"**Trend signal record** (last ~{HISTORY_HOURS} hours, source: {rec['source']})")
-    _metric_row(rec["wins"], rec["losses"])
-    rows = rec["rows"]
-    ups, dns = rows[rows["signal"] == "UP"], rows[rows["signal"] == "DOWN"]
-    st.caption(
-        f"UP calls {int(ups['win'].sum())}–{len(ups) - int(ups['win'].sum())} · "
-        f"DOWN calls {int(dns['win'].sum())}–{len(dns) - int(dns['win'].sum())} · "
-        f"{rec['n_none']} of {rec['n_windows']} windows had no signal · "
-        + (f"for context, {rec['up_rate']:.0%} of those windows settled UP." if rec["n_windows"] else
-           "no graded windows yet."))
-    if rec["source"].startswith("Exchange") and not serr:
-        st.warning(f"Kalshi returned no settled {spec.series} markets, so this record is an est... (12 KB left)
-app.py
-62 KB
+        out = pd.DataF... (35 KB left)
