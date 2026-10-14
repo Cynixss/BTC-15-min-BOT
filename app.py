@@ -1,13 +1,16 @@
 """
-app.py: Live Bitcoin 15-minute action dashboard for Kalshi KXBTC15M markets.
+app.py: Live Bitcoin 15- and 30-minute action dashboard for Kalshi BTC Up/Down markets.
 
 Read-only and keyless: it uses only public endpoints and never places orders.
   * Candles + live tick : Coinbase Exchange (primary), Binance.US / Binance (fallbacks)
-  * Contracts           : Kalshi public Trade API v2  GET /markets?series_ticker=KXBTC15M
+  * Contracts           : Kalshi public Trade API v2  GET /markets?series_ticker=KXBTC15M (and 30M)
 
 Kalshi resolves each window on CF Benchmarks' BRTI: YES if the 60-second average
 before the close is >= the 60-second average before the window opened. The
 "target" line is that opening reference (Kalshi's strike), editable by hand.
+
+WIN / LOSS: a call is a WIN when it matches Kalshi's own settled result for that market
+(result "yes" = UP won, "no" = DOWN won). Ties settle YES (UP), per the rule above.
 
 Deploy on Streamlit Community Cloud with this file plus requirements.txt.
 Run locally:  streamlit run app.py
@@ -18,7 +21,6 @@ from __future__ import annotations
 import html
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -30,11 +32,11 @@ from plotly.subplots import make_subplots
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-INTERVAL = pd.Timedelta(minutes=15)
-INTERVAL_SECONDS = 900
+BASE_SECONDS = 900  # exchange candles are fetched at 15m and rolled up for longer windows
 OHLCV = ["open", "high", "low", "close", "volume"]
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KALSHI_SERIES = "KXBTC15M"
+SERIES_DEFAULTS = {15: "KXBTC15M", 30: "KXBTC30M"}  # 30M ticker is a best guess; editable in the sidebar
+HISTORY_HOURS = 76  # ~300 fifteen-minute candles, the most the exchange APIs return
 HEADERS = {"User-Agent": "btc-15m-dashboard/1.0 (streamlit)"}
 HTTP_TIMEOUT = 10
 
@@ -44,6 +46,30 @@ GREEN, RED, AMBER, BLUE = "#26a69a", "#ef5350", "#f5a623", "#4a90e2"
 
 TIMEZONES = ["UTC", "America/Chicago", "America/New_York", "America/Los_Angeles",
              "Europe/London", "Asia/Tokyo"]
+
+
+@dataclass(frozen=True)
+class Spec:
+    """One Kalshi market length (15 or 30 minutes) and the series that trades it."""
+    minutes: int
+    series: str
+
+    @property
+    def seconds(self) -> int:
+        return self.minutes * 60
+
+    @property
+    def delta(self) -> pd.Timedelta:
+        return pd.Timedelta(minutes=self.minutes)
+
+    @property
+    def freq(self) -> str:
+        return f"{self.minutes}min"
+
+    @property
+    def sigma_scale(self) -> float:
+        """Volatility floors below were tuned for 15m; random-walk scaling for longer windows."""
+        return math.sqrt(self.minutes / 15)
 
 
 # --------------------------------------------------------------------------- #
@@ -63,7 +89,7 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
 def _from_coinbase() -> pd.DataFrame:
     # rows: [time, low, high, open, close, volume], newest first, max 300
     rows = _get("https://api.exchange.coinbase.com/products/BTC-USD/candles",
-                {"granularity": INTERVAL_SECONDS})
+                {"granularity": BASE_SECONDS})
     df = pd.DataFrame(rows, columns=["time", "low", "high", "open", "close", "volume"])
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     return _normalise(df)
@@ -89,7 +115,7 @@ CANDLE_SOURCES = [
 @st.cache_data(ttl=10, show_spinner=False)
 def fetch_candles() -> tuple[pd.DataFrame, str]:
     """Latest ~300 15m candles (includes the still-forming one). Cached and shared
-    between all visitors so a busy public app doesn't hammer the exchange."""
+    between all visitors and both tabs so a busy public app doesn't hammer the exchange."""
     errors = []
     for name, fn in CANDLE_SOURCES:
         try:
@@ -100,6 +126,23 @@ def fetch_candles() -> tuple[pd.DataFrame, str]:
         except Exception as exc:  # network / HTTP / parse: try the next source
             errors.append(f"{name}: {exc}")
     raise RuntimeError(" | ".join(errors))
+
+
+def resample_candles(df15: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Roll 15-minute candles up to `minutes` (Coinbase has no 30m granularity).
+    Buckets align to :00/:30 UTC. The oldest bucket is dropped if incomplete; the newest
+    (still forming) bucket is kept."""
+    if minutes == BASE_SECONDS // 60:
+        return df15
+    per = minutes // (BASE_SECONDS // 60)
+    g = df15.resample(f"{minutes}min", label="left", closed="left")
+    out = g.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+    n = g["close"].count()
+    out, n = out[n > 0], n[n > 0]
+    if len(out) and n.iloc[0] < per:
+        out = out.iloc[1:]
+    out.index.name = df15.index.name
+    return out
 
 
 @st.cache_data(ttl=1, show_spinner=False)
@@ -132,11 +175,11 @@ def _cents(m: dict, key: str):
 
 
 @st.cache_data(ttl=2, show_spinner=False)
-def fetch_kalshi_markets() -> pd.DataFrame:
-    """Open KXBTC15M markets, soonest-closing first."""
+def fetch_kalshi_markets(series: str) -> pd.DataFrame:
+    """Open markets of one series, soonest-closing first."""
     raw, cursor = [], None
     for _ in range(5):  # pagination safety cap
-        params = {"series_ticker": KALSHI_SERIES, "status": "open", "limit": 100}
+        params = {"series_ticker": series, "status": "open", "limit": 100}
         if cursor:
             params["cursor"] = cursor
         data = _get(f"{KALSHI_BASE}/markets", params)
@@ -163,6 +206,44 @@ def fetch_kalshi_markets() -> pd.DataFrame:
     return df.sort_values("close_time").reset_index(drop=True)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_kalshi_settled(series: str, hours: int = HISTORY_HOURS) -> pd.DataFrame:
+    """Recently settled markets of one series with Kalshi's own result.
+    `result` is "yes" (UP won) or "no" (DOWN won); unsettled/voided markets are skipped."""
+    now = pd.Timestamp.now(tz="UTC")
+    cutoff = now - pd.Timedelta(hours=hours)
+
+    def pull(params: dict) -> list[dict]:
+        out, cursor = [], None
+        for _ in range(5):
+            p = dict(params)
+            if cursor:
+                p["cursor"] = cursor
+            data = _get(f"{KALSHI_BASE}/markets", p)
+            out.extend(data.get("markets", []))
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+        return out
+
+    try:
+        raw = pull({"series_ticker": series, "min_close_ts": int(cutoff.timestamp()), "limit": 1000})
+    except requests.HTTPError:  # some API versions reject the timestamp filter; fall back
+        raw = pull({"series_ticker": series, "status": "settled", "limit": 1000})
+
+    rows = []
+    for m in raw:
+        res = str(m.get("result") or "").lower()
+        if res not in ("yes", "no"):
+            continue
+        rows.append({"ticker": m.get("ticker"),
+                     "close_time": pd.to_datetime(m.get("close_time"), utc=True, errors="coerce"),
+                     "result": res})
+    df = pd.DataFrame(rows, columns=["ticker", "close_time", "result"]).dropna(subset=["close_time"])
+    df = df[df["close_time"] >= cutoff]
+    return df.sort_values("close_time").reset_index(drop=True)
+
+
 # --------------------------------------------------------------------------- #
 # Indicators (pure pandas, so deployment needs no TA library)
 # --------------------------------------------------------------------------- #
@@ -178,7 +259,7 @@ def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
     return 100 - 100 / (1 + gain / loss)  # loss == 0 -> inf -> RSI 100
 
 
-def compute_indicators(raw: pd.DataFrame, lookback: int = 5) -> pd.DataFrame:
+def compute_indicators(raw: pd.DataFrame, lookback: int, delta: pd.Timedelta) -> pd.DataFrame:
     df = raw.copy()
     close, vol = df["close"], df["volume"]
 
@@ -217,8 +298,15 @@ def compute_indicators(raw: pd.DataFrame, lookback: int = 5) -> pd.DataFrame:
     df["body_ratio"] = (df["body"] / rng).fillna(0.0)
 
     df["rel_volume"] = vol / vol.rolling(20, min_periods=5).mean()
-    df["is_closed"] = (df.index + INTERVAL) <= pd.Timestamp.now(tz="UTC")
+    df["is_closed"] = (df.index + delta) <= pd.Timestamp.now(tz="UTC")
     return df
+
+
+def signal_series(df: pd.DataFrame, rsi_ob: float, rsi_os: float) -> pd.Series:
+    """The headline trend rule evaluated on every candle (same rule as analyze())."""
+    up = (df["ema_9"] > df["ema_21"]) & (df["rsi_14"] < rsi_ob)
+    dn = (df["ema_9"] < df["ema_21"]) & (df["rsi_14"] > rsi_os)
+    return pd.Series(np.select([up, dn], ["UP", "DOWN"], "NONE"), index=df.index)
 
 
 # --------------------------------------------------------------------------- #
@@ -344,14 +432,15 @@ def analyze(df: pd.DataFrame, rsi_ob: float, rsi_os: float, lookback: int) -> An
 
 
 # --------------------------------------------------------------------------- #
-# Live snapshot (one shared, 1-second-cached bundle of everything the UI needs)
+# Live snapshot (candles + live tick + indicators + Kalshi markets for one interval)
 # --------------------------------------------------------------------------- #
-def overlay_live_price(raw: pd.DataFrame, price: float | None, now: pd.Timestamp) -> pd.DataFrame:
+def overlay_live_price(raw: pd.DataFrame, price: float | None, now: pd.Timestamp,
+                       spec: Spec) -> pd.DataFrame:
     """Fold the live tick into the forming candle (or start one if the feed lags)."""
     if price is None:
         return raw
     raw = raw.copy()
-    window_start = now.floor("15min")
+    window_start = now.floor(spec.freq)
     if raw.index[-1] >= window_start:  # forming candle already published
         i = raw.index[-1]
         raw.loc[i, "close"] = price
@@ -364,38 +453,39 @@ def overlay_live_price(raw: pd.DataFrame, price: float | None, now: pd.Timestamp
     return out
 
 
-def realized_sigma(df: pd.DataFrame) -> float:
-    """Std-dev of 15-minute log returns over the last ~16 hours (as a fraction)."""
+def realized_sigma(df: pd.DataFrame, spec: Spec) -> float:
+    """Std-dev of this interval's log returns over the last ~65 closed candles (as a fraction)."""
     closes = df.loc[df["is_closed"], "close"].tail(65)
     rets = np.log(closes).diff().dropna()
-    sigma = float(rets.std()) if len(rets) >= 10 else 0.002
-    return max(sigma, 0.0007)
+    sigma = float(rets.std()) if len(rets) >= 10 else 0.002 * spec.sigma_scale
+    return max(sigma, 0.0007 * spec.sigma_scale)
 
 
-def get_snapshot(lookback: int, offset: float, rsi_ob: float, rsi_os: float) -> dict:
-    """Candles + live tick + indicators + Kalshi markets, computed at most once per second
-    no matter how many fragments or visitors ask for it."""
+def get_snapshot(spec: Spec, lookback: int, offset: float, rsi_ob: float, rsi_os: float) -> dict:
+    """Candles + live tick + indicators + Kalshi markets for one interval. The network calls
+    inside are cached and shared between visitors and tabs; the pandas work is cheap."""
     now = pd.Timestamp.now(tz="UTC")
-    raw, candle_src = fetch_candles()  # raises if every exchange fails; caller handles it
+    raw15, candle_src = fetch_candles()  # raises if every exchange fails; caller handles it
+    raw = resample_candles(raw15, spec.minutes)
     tick, tick_src = None, None
     try:
         tick, tick_src = fetch_ticker()
     except Exception:
         pass
-    raw = overlay_live_price(raw, tick, now)
+    raw = overlay_live_price(raw, tick, now, spec)
     raw = raw.copy()
     raw[["open", "high", "low", "close"]] += offset  # put the feed on Kalshi's (BRTI) price scale
-    df = compute_indicators(raw, lookback)
+    df = compute_indicators(raw, lookback, spec.delta)
 
     markets, kalshi_err = None, None
     try:
-        markets = fetch_kalshi_markets()
+        markets = fetch_kalshi_markets(spec.series)
     except Exception as exc:
         kalshi_err = f"{type(exc).__name__}: {exc}"
 
     return dict(
         df=df, candle_src=candle_src, tick_src=tick_src, spot=float(df["close"].iloc[-1]),
-        sigma15=realized_sigma(df), analysis=analyze(df, rsi_ob, rsi_os, lookback),
+        sigma=realized_sigma(df, spec), analysis=analyze(df, rsi_ob, rsi_os, lookback),
         markets=markets, kalshi_err=kalshi_err,
     )
 
@@ -403,8 +493,10 @@ def get_snapshot(lookback: int, offset: float, rsi_ob: float, rsi_os: float) -> 
 # --------------------------------------------------------------------------- #
 # Probability model + decision engine
 # --------------------------------------------------------------------------- #
-def model_prob_up(spot: float, target: float, secs_left: float, sigma15: float) -> tuple[float, float]:
+def model_prob_up(spot: float, target: float, secs_left: float, sigma: float,
+                  interval_seconds: int) -> tuple[float, float]:
     """P(final settlement >= target) under a random walk, plus the 1-sigma move in USD.
+    `sigma` is the std-dev of one full interval's return.
 
     Kalshi settles on the 60-second average of BRTI before close, so less than the full
     remaining time is 'uncertain': variance-time = secs_left - 40 (>= 60s left), and
@@ -412,7 +504,7 @@ def model_prob_up(spot: float, target: float, secs_left: float, sigma15: float) 
     """
     eff = secs_left - 40 if secs_left >= 60 else secs_left ** 3 / 10800
     eff = max(eff, 1.0)
-    sd = max(sigma15 * spot * math.sqrt(eff / INTERVAL_SECONDS), 0.5)
+    sd = max(sigma * spot * math.sqrt(eff / interval_seconds), 0.5)
     z = (spot - target) / sd
     return 0.5 * (1 + math.erf(z / math.sqrt(2))), sd
 
@@ -442,16 +534,17 @@ def _side_label(side: str) -> str:
 
 
 def decide(a: Analysis | None, spot: float | None, target: float | None, secs_left: float | None,
-           sigma15: float, q: dict, pos: dict | None, r: Rules) -> Decision:
+           sigma: float, q: dict, pos: dict | None, r: Rules, interval_seconds: int) -> Decision:
     """Turn trend analysis + price-vs-target + Kalshi quotes + your position into ONE action."""
     if a is None or spot is None or target is None or secs_left is None:
         why = ("No open Kalshi market found" if secs_left is None else
-               "No target price. Enter one in the sidebar" if target is None else "Waiting for data")
+               "No target price. Enter one under 'My position & target line'" if target is None
+               else "Waiting for data")
         return Decision("WAIT", "WAIT", why, [why + "."])
     if secs_left <= 0:
         return Decision("WAIT", "WAIT", "Market is closing", ["The current market has closed; a new one lists shortly."])
 
-    p_up, sd = model_prob_up(spot, target, secs_left, sigma15)
+    p_up, sd = model_prob_up(spot, target, secs_left, sigma, interval_seconds)
     p_dn = 1 - p_up
     dist = spot - target
     ctx = (f"BTC {_usd(spot)} is {_usd(abs(dist))} {'above' if dist >= 0 else 'below'} the target "
@@ -534,10 +627,11 @@ def decide(a: Analysis | None, spot: float | None, target: float | None, secs_le
                     f"Ask {ask}¢ · model {ps:.0%} · edge {edge:+.0f}¢", reasons, p_up, sd)
 
 
-def debounce(action: str, ticker: str | None, has_pos: bool) -> tuple[bool, int, int]:
+def debounce(slot: str, action: str, ticker: str | None, has_pos: bool) -> tuple[bool, int, int]:
     """BUY needs 3 consecutive 1-second reads and SELL needs 2, so a single noisy tick can't
-    flash a trade call. WAIT/HOLD show immediately. Returns (confirmed, count, needed)."""
-    d = st.session_state.setdefault("deb", {})
+    flash a trade call. WAIT/HOLD show immediately. `slot` keeps each interval's counter separate.
+    Returns (confirmed, count, needed)."""
+    d = st.session_state.setdefault("deb", {}).setdefault(slot, {})
     key = (ticker, has_pos)
     if d.get("key") != key:
         d.update(key=key, raw=None, n=0)
@@ -550,22 +644,118 @@ def debounce(action: str, ticker: str | None, has_pos: bool) -> tuple[bool, int,
 
 
 # --------------------------------------------------------------------------- #
+# Win / loss records
+#
+# A WIN is a call that matches how KALSHI settled the market: result "yes" = UP won,
+# "no" = DOWN won. Two records:
+#   1) Trend-signal record: replays the headline UP/DOWN rule over the recent windows
+#      Kalshi has already settled (works immediately, no waiting).
+#   2) Live record: dashboard BUY calls and positions you mark, graded as markets settle.
+#      It lives in your browser session, so download the CSV to keep it.
+# --------------------------------------------------------------------------- #
+def fmt_ratio(wins: int, losses: int) -> str:
+    if wins + losses == 0:
+        return "—"
+    return "∞" if losses == 0 else f"{wins / losses:.2f}"
+
+
+def fmt_rate(wins: int, losses: int) -> str:
+    return "—" if wins + losses == 0 else f"{wins / (wins + losses):.1%}"
+
+
+def signal_record(df: pd.DataFrame, settled: pd.DataFrame | None, spec: Spec,
+                  rsi_ob: float, rsi_os: float) -> dict:
+    """Grade the trend signal against Kalshi's settled results.
+
+    The signal for the window that opens at T is the one from the candle that closed at T
+    (opened T - interval), so nothing is looked up from the future."""
+    sig = signal_series(df, rsi_ob, rsi_os)
+    if settled is not None and not settled.empty:
+        source = "Kalshi settled results"
+        out = pd.DataFrame({
+            "window_start": settled["close_time"] - spec.delta,
+            "outcome": settled["result"].map({"yes": "UP", "no": "DOWN"}),
+            "ticker": settled["ticker"],
+        })
+    else:
+        source = "Exchange candles (estimate: close >= open)"
+        c = df[df["is_closed"]]
+        out = pd.DataFrame({"window_start": c.index,
+                            "outcome": np.where(c["close"] >= c["open"], "UP", "DOWN"),
+                            "ticker": ""})
+    out = out.dropna(subset=["outcome"]).reset_index(drop=True)
+    out["signal"] = sig.reindex(out["window_start"] - spec.delta).to_numpy()
+    out = out[out["signal"].notna()]  # windows older than the loaded candles can't be graded
+    called = out[out["signal"].isin(["UP", "DOWN"])].copy()
+    called["win"] = called["signal"] == called["outcome"]
+    wins = int(called["win"].sum())
+    return dict(rows=called, wins=wins, losses=len(called) - wins, n_windows=len(out),
+                n_none=len(out) - len(called), source=source,
+                up_rate=float((out["outcome"] == "UP").mean()) if len(out) else float("nan"))
+
+
+def ledger_log(kind: str, minutes: int, ticker: str, side: str, entry, replace: bool = False) -> None:
+    """Record a BOT call or a ME position once per market."""
+    rows = st.session_state.setdefault("ledger", [])
+    for r in rows:
+        if r["kind"] == kind and r["ticker"] == ticker:
+            if replace and r["result"] is None:
+                r["side"], r["entry"] = side, entry
+            return
+    rows.append(dict(kind=kind, minutes=minutes, ticker=ticker, side=side, entry=entry,
+                     logged_at=pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S"),
+                     result=None, win=None, pnl=None))
+
+
+def ledger_mark_sold(kind: str, ticker: str) -> None:
+    """You exited early, so Kalshi's settlement isn't your result; keep it out of the W/L count."""
+    for r in st.session_state.get("ledger", []):
+        if r["kind"] == kind and r["ticker"] == ticker and r["result"] is None:
+            r["result"] = "SOLD"
+
+
+def ledger_settle(settled: pd.DataFrame | None) -> None:
+    """Grade every pending row whose market Kalshi has settled."""
+    if settled is None or settled.empty:
+        return
+    res = dict(zip(settled["ticker"], settled["result"]))
+    for r in st.session_state.get("ledger", []):
+        if r["result"] is None and r["ticker"] in res:
+            r["result"] = res[r["ticker"]]
+            r["win"] = r["side"] == r["result"]
+            e = r["entry"]
+            r["pnl"] = None if e is None else ((100 - e) if r["win"] else -e)
+
+
+def ledger_stats(kind: str, minutes: int) -> dict:
+    mine = [r for r in st.session_state.get("ledger", [])
+            if r["kind"] == kind and r["minutes"] == minutes]
+    done = [r for r in mine if r["win"] is not None]
+    wins = sum(1 for r in done if r["win"])
+    return dict(rows=mine, wins=wins, losses=len(done) - wins,
+                pending=sum(1 for r in mine if r["result"] is None),
+                sold=sum(1 for r in mine if r["result"] == "SOLD"),
+                pnl=sum(r["pnl"] for r in done if r["pnl"] is not None))
+
+
+# --------------------------------------------------------------------------- #
 # Target resolution (Kalshi strike, fallback estimate, or manual override)
 # --------------------------------------------------------------------------- #
-def resolve_target(cur: pd.Series | None, df: pd.DataFrame) -> tuple[float | None, str, str | None]:
-    ss = st.session_state
+def resolve_target(cur: pd.Series | None, df: pd.DataFrame,
+                   spec: Spec) -> tuple[float | None, str, str | None]:
+    ss, k = st.session_state, spec.minutes
     ticker = cur["ticker"] if cur is not None else None
     note = None
-    if ss.get("use_manual_target") and float(ss.get("manual_target") or 0) > 0:
-        if ss.get("manual_target_ticker") == ticker:
-            return float(ss["manual_target"]), "Manual", None
+    if ss.get(f"use_manual_target_{k}") and float(ss.get(f"manual_target_{k}") or 0) > 0:
+        if ss.get(f"manual_target_ticker_{k}") == ticker:
+            return float(ss[f"manual_target_{k}"]), "Manual", None
         note = "Your manual target was for an earlier market and is ignored. Re-enter it for this one."
     if cur is not None and pd.notna(cur["strike"]):
         return float(cur["strike"]), "Kalshi strike", note
     if cur is not None:
-        start = cur["close_time"] - INTERVAL
+        start = cur["close_time"] - spec.delta
         if start in df.index:
-            return float(df.at[start, "open"]), "Estimated (15m candle open)", note
+            return float(df.at[start, "open"]), f"Estimated ({spec.minutes}m candle open)", note
     return None, "Unavailable", note
 
 
@@ -573,10 +763,10 @@ def _int_or_none(v):
     return int(v) if pd.notna(v) else None
 
 
-def get_context(cfg: dict) -> dict | None:
+def get_context(cfg: dict, spec: Spec) -> dict | None:
     """Everything a UI fragment needs, or None (after showing an error)."""
     try:
-        snap = get_snapshot(cfg["lookback"], cfg["offset"], cfg["rsi_ob"], cfg["rsi_os"])
+        snap = get_snapshot(spec, cfg["lookback"], cfg["offset"], cfg["rsi_ob"], cfg["rsi_os"])
     except Exception as exc:
         st.error(f"Could not load candle data from any exchange. {exc}")
         return None
@@ -586,7 +776,7 @@ def get_context(cfg: dict) -> dict | None:
         live = snap["markets"][snap["markets"]["close_time"] > now]
         if not live.empty:
             cur = live.iloc[0]
-    target, tsrc, tnote = resolve_target(cur, snap["df"])
+    target, tsrc, tnote = resolve_target(cur, snap["df"], spec)
     quotes = {k: _int_or_none(cur[k]) for k in ("yes_bid", "yes_ask", "no_bid", "no_ask")} if cur is not None else {}
     secs_left = (cur["close_time"] - now).total_seconds() if cur is not None else None
     return dict(snap=snap, now=now, cur=cur, target=target, tsrc=tsrc, tnote=tnote,
@@ -689,15 +879,17 @@ def render_trend_breakdown(a: Analysis | None) -> None:
         st.warning("**Caution flags**\n\n" + "\n".join(f"- {c}" for c in a.cautions))
 
 
-def render_kalshi(ctx: dict, tz: str) -> None:
-    st.subheader("Kalshi 15-minute BTC contracts")
+def render_kalshi(ctx: dict, tz: str, spec: Spec) -> None:
+    st.subheader(f"Kalshi {spec.minutes}-minute BTC contracts")
     snap, cur = ctx["snap"], ctx["cur"]
     if snap["kalshi_err"]:
         st.info(f"Kalshi market data is unavailable right now ({snap['kalshi_err'][:80]}). "
                 "Charts and trend analysis still work, but trade calls need Kalshi prices.")
         return
     if cur is None:
-        st.info("No open KXBTC15M market found. A new one usually lists at the next quarter-hour.")
+        st.info(f"No open {spec.series} market found. A new one usually lists at the next "
+                f"{spec.minutes}-minute mark. If this never changes, check the series ticker in the sidebar "
+                "(Kalshi may not list this market length).")
         return
     mins, secs = divmod(max(int(ctx["secs_left"]), 0), 60)
     st.markdown(f"`{cur['ticker']}` · closes in **{mins}:{secs:02d}**  \n{cur['title']}")
@@ -719,26 +911,31 @@ def render_kalshi(ctx: dict, tz: str) -> None:
         st.dataframe(show, hide_index=True, width="stretch")
 
 
-def live_top(cfg: dict) -> None:
+def live_top(cfg: dict, spec: Spec) -> None:
     """Action banner + live metrics. Re-runs every second."""
-    ctx = get_context(cfg)
+    k = spec.minutes
+    ctx = get_context(cfg, spec)
     if ctx is None:
         return
     ss, cur, snap = st.session_state, ctx["cur"], ctx["snap"]
     ticker = cur["ticker"] if cur is not None else None
-    ss["cur_ticker"], ss["quotes"] = ticker, ctx["quotes"]  # read by the sidebar buttons
+    ss[f"cur_ticker_{k}"], ss[f"quotes_{k}"] = ticker, ctx["quotes"]  # read by the position buttons
 
     # A position only lives until its own market closes
-    pos, expired = ss.get("position"), False
+    pos_key = f"position_{k}"
+    pos, expired = ss.get(pos_key), False
     if pos and pos.get("ticker") != ticker:
-        ss["position"], pos, expired = None, None, True
+        ss[pos_key], pos, expired = None, None, True
 
-    dec = decide(snap["analysis"], ctx["spot"], ctx["target"], ctx["secs_left"], snap["sigma15"],
-                 ctx["quotes"], pos, cfg["rules"])
-    confirmed, n, need = debounce(dec.action, ticker, pos is not None)
+    dec = decide(snap["analysis"], ctx["spot"], ctx["target"], ctx["secs_left"], snap["sigma"],
+                 ctx["quotes"], pos, cfg["rules"], spec.seconds)
+    confirmed, n, need = debounce(f"ui{k}", dec.action, ticker, pos is not None)
 
     if confirmed:
         title, subtitle, color = dec.title, dec.subtitle, ACTION_COLORS[dec.action]
+        if dec.action in ("BUY UP", "BUY DOWN") and ticker:  # log it so it can be graded at settlement
+            side = "yes" if dec.action == "BUY UP" else "no"
+            ledger_log("BOT", k, ticker, side, ctx["quotes"].get("yes_ask" if side == "yes" else "no_ask"))
     else:  # signal is forming but hasn't held for enough consecutive seconds
         fallback = "HOLD" if pos else "WAIT"
         title = fallback
@@ -774,166 +971,79 @@ def live_top(cfg: dict) -> None:
     if ctx["tnote"]:
         st.warning(ctx["tnote"])
     if ctx["tsrc"].startswith("Estimated"):
-        st.caption("Kalshi's strike wasn't in the API response, so the target is estimated from the 15-minute "
-                   "candle open. Check it against Kalshi and use the manual override if it's off.")
+        st.caption(f"Kalshi's strike wasn't in the API response, so the target is estimated from the "
+                   f"{k}-minute candle open. Check it against Kalshi and use the manual override if it's off.")
     if snap["tick_src"] is None:
         st.warning("Live price feed unavailable; using the last candle close instead.")
-    if ctx["now"] - snap["df"].index[-1] > pd.Timedelta(minutes=20):
+    if ctx["now"] - snap["df"].index[-1] > pd.Timedelta(minutes=20 + k):
         st.warning("The newest candle is more than 20 minutes old. The data feed may be lagging.")
 
 
-def chart_panel(cfg: dict) -> None:
+def chart_panel(cfg: dict, spec: Spec) -> None:
     """Interactive chart. Re-runs every few seconds (a full redraw each second is too heavy)."""
-    ctx = get_context(cfg)
+    ctx = get_context(cfg, spec)
     if ctx is None:
         return
     df = ctx["snap"]["df"]
     view = df.tail(cfg["n_candles"]).copy()
     view.index = view.index.tz_convert(cfg["tz"]).tz_localize(None)  # wall-clock times in chosen tz
     st.plotly_chart(build_chart(view, cfg["rsi_ob"], cfg["rsi_os"], cfg["tz"], ctx["target"], ctx["tsrc"]),
-                    width="stretch")
-    st.caption(f"Candles: {ctx['snap']['candle_src']} · live tick: {ctx['snap']['tick_src'] or 'n/a'} · "
+                    width="stretch", key=f"chart_{spec.minutes}")
+    st.caption(f"{spec.minutes}-minute candles: {ctx['snap']['candle_src']} · live tick: "
+               f"{ctx['snap']['tick_src'] or 'n/a'} · "
                "the rightmost candle is still forming; trend signals use the last closed candle.")
 
 
-def live_side(cfg: dict) -> None:
-    ctx = get_context(cfg)
+def live_side(cfg: dict, spec: Spec) -> None:
+    ctx = get_context(cfg, spec)
     if ctx is None:
         return
     render_trend_breakdown(ctx["snap"]["analysis"])
     st.divider()
-    render_kalshi(ctx, cfg["tz"])
+    render_kalshi(ctx, cfg["tz"], spec)
 
 
-def render_data_table(cfg: dict) -> None:
-    """Static-ish extras (refreshes with the chart)."""
-    ctx = get_context(cfg)
+def _metric_row(wins: int, losses: int) -> None:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Wins", wins)
+    c2.metric("Losses", losses)
+    c3.metric("W/L ratio", fmt_ratio(wins, losses))
+    c4.metric("Win rate", fmt_rate(wins, losses))
+
+
+def record_panel(cfg: dict, spec: Spec) -> None:
+    """Win/loss records graded against Kalshi's settled results."""
+    k = spec.minutes
+    ctx = get_context(cfg, spec)
     if ctx is None:
         return
-    df = ctx["snap"]["df"]
-    closed = df[df["is_closed"]]
-    with st.expander("Recent candles, wick distances and indicator values"):
-        cols = ["open", "high", "low", "close", "volume", "body", "upper_wick", "lower_wick",
-                "upper_wick_ratio", "lower_wick_ratio", "ema_9", "ema_21", "rsi_14",
-                "pvt", "pvt_mismatch"]
-        table = closed[cols].tail(30).iloc[::-1].round(4)
-        table.index = table.index.tz_convert(cfg["tz"]).strftime("%m-%d %H:%M")
-        st.dataframe(table, width="stretch")
-        st.download_button("Download all indicator data (CSV)",
-                           df.drop(columns=["is_closed"]).to_csv().encode(),
-                           file_name="btc_15m_indicators.csv", mime="text/csv", key="dl_csv")
+    settled, serr = None, None
+    try:
+        settled = fetch_kalshi_settled(spec.series, HISTORY_HOURS)
+    except Exception as exc:
+        serr = f"{type(exc).__name__}: {exc}"
+    ledger_settle(settled)
 
+    st.subheader(f"Win / loss record · {k}-minute")
+    st.caption("A win means your call matched Kalshi's settled result: UP wins if the 60-second BRTI average "
+               f"before the close is at least the one before the {k}-minute window opened (ties go to UP), "
+               "otherwise DOWN wins.")
+    if serr:
+        st.info(f"Kalshi's settled results are unavailable right now ({serr[:80]}).")
 
-def render_footer() -> None:
-    with st.expander("How the calls are made"):
-        st.markdown(
-            "**What Kalshi pays on:** each 15-minute market resolves YES if the 60-second average of "
-            "CF Benchmarks' BRTI before the close is at least the 60-second average before the window "
-            "opened. That opening reference is the **target**. It pays on price versus target at the end, "
-            "not on trend.\n\n"
-            "**Model chance:** a random-walk estimate of finishing above the target, using recent 15-minute "
-            "volatility, time left, and the 60-second averaging. It is crude. It ignores news, order flow, "
-            "and the small gap between Coinbase and BRTI (use the price offset to correct that).\n\n"
-            "**BUY UP / BUY DOWN:** the EMA/RSI trend and the price-vs-target model must agree, the model "
-            "chance must beat your threshold, the ask must be below your limit with enough edge over it, "
-            "no opposing PVT mismatch, and enough time left. Must hold for 3 consecutive seconds.\n\n"
-            "**HOLD / SELL (needs you to mark your position):** SELL if the model chance for your side "
-            "drops below the sell threshold, or the trend flipped and your chance is under 60%. "
-            "Otherwise HOLD. A flipped trend alone does not trigger a sell if price is still safely on "
-            "your side of the target.\n\n"
-            "**WAIT:** anything else. The reasons are listed under *Why this call*.")
-    st.caption("Educational tool, not financial advice. Read-only: this app uses public data and cannot place "
-               "or see any trades. Calls are simple rules with no proven edge, and prediction-market "
-               "contracts can lose their full price.")
-
-
-# --------------------------------------------------------------------------- #
-# Sidebar callbacks + entry point
-# --------------------------------------------------------------------------- #
-def _stamp_manual_target() -> None:
-    st.session_state["manual_target_ticker"] = st.session_state.get("cur_ticker")
-
-
-def _set_position(side: str) -> None:
-    ss = st.session_state
-    q = ss.get("quotes") or {}
-    override = int(ss.get("entry_override") or 0)
-    entry = override if override > 0 else q.get("yes_ask" if side == "yes" else "no_ask")
-    ss["position"] = {"side": side, "ticker": ss.get("cur_ticker"), "entry": entry}
-
-
-def _clear_position() -> None:
-    st.session_state["position"] = None
-
-
-def main() -> None:
-    st.set_page_config(page_title="BTC 15m Live Action", page_icon="₿", layout="wide")
-    st.title("₿ Bitcoin 15-Minute Live Action Dashboard")
-    st.caption("Live BTC price + Kalshi KXBTC15M contracts · public data, no login · tells you BUY / WAIT / HOLD / SELL")
-
-    with st.sidebar:
-        st.header("Controls")
-        if st.button("🔄 Refresh market data"):
-            for fn in (fetch_candles, fetch_kalshi_markets, fetch_ticker, get_snapshot):
-                fn.clear()
-        auto = st.toggle("Auto-refresh", value=True)
-        live_secs = st.slider("Live refresh (seconds)", 1, 10, 1, disabled=not auto)
-        chart_secs = st.slider("Chart refresh (seconds)", 2, 30, 5, disabled=not auto)
-
-        st.divider()
-        st.subheader("My position")
-        st.caption("The app can't see your Kalshi account. Tell it what you bought to get HOLD/SELL calls.")
-        st.button("✅ I bought UP (YES)", on_click=_set_position, args=("yes",))
-        st.button("✅ I bought DOWN (NO)", on_click=_set_position, args=("no",))
-        st.button("⬜ I'm flat / I sold", on_click=_clear_position)
-        st.number_input("Entry price override (¢, 0 = current ask)", 0, 99, 0, key="entry_override")
-
-        st.divider()
-        st.subheader("Target line")
-        st.caption("Default is Kalshi's strike. Override if it doesn't match what Kalshi shows. "
-                   "Applies to the current market only.")
-        st.checkbox("Override target manually", key="use_manual_target", on_change=_stamp_manual_target)
-        st.number_input("Manual target ($)", 0.0, 1_000_000.0, 0.0, step=1.0, format="%.2f",
-                        key="manual_target", on_change=_stamp_manual_target)
-        offset = st.number_input("Price feed offset ($)", -500.0, 500.0, 0.0, step=1.0, format="%.2f",
-                                 help="Added to every Coinbase price. Set it to (Kalshi's live BTC price − "
-                                      "this app's live price) so both are on the same scale.")
-
-        with st.expander("Decision rules"):
-            min_p = st.slider("Min model chance to BUY (%)", 50, 90, 60)
-            min_edge = st.slider("Min edge over ask (¢)", 0, 15, 3)
-            max_price = st.slider("Max price to pay (¢)", 50, 99, 85)
-            min_secs = st.slider("No new entries in last (s)", 10, 180, 45)
-            sell_below = st.slider("SELL if your chance drops below (%)", 10, 50, 40)
-
-        with st.expander("Chart & indicators"):
-            n_candles = st.slider("Candles shown", 60, 300, 120, step=10)
-            tz = st.selectbox("Display timezone", TIMEZONES, index=0)
-            rsi_ob = st.number_input("RSI overbought", 50.0, 95.0, 70.0, step=1.0)
-            rsi_os = st.number_input("RSI oversold", 5.0, 50.0, 30.0, step=1.0)
-            lookback = st.slider("PVT mismatch lookback (candles)", 3, 15, 5)
-
-    cfg = dict(n_candles=n_candles, tz=tz, rsi_ob=rsi_ob, rsi_os=rsi_os, lookback=lookback,
-               offset=offset,
-               rules=Rules(min_p=min_p / 100, min_edge=float(min_edge), max_price=max_price,
-                           min_secs=min_secs, sell_below=sell_below / 100))
-
-    fast = live_secs if auto else None
-    slow = chart_secs if auto else None
-    top_frag = st.fragment(run_every=fast)(live_top)
-    chart_frag = st.fragment(run_every=slow)(chart_panel)
-    side_frag = st.fragment(run_every=fast)(live_side)
-    table_frag = st.fragment(run_every=slow)(render_data_table)
-
-    top_frag(cfg)
-    chart_col, side_col = st.columns([3, 2], gap="medium")
-    with chart_col:
-        chart_frag(cfg)
-    with side_col:
-        side_frag(cfg)
-    table_frag(cfg)
-    render_footer()
-
-
-if __name__ == "__main__":
-    main()
+    # ---- 1) trend signal replayed over windows Kalshi already settled ----
+    rec = signal_record(ctx["snap"]["df"], settled, spec, cfg["rsi_ob"], cfg["rsi_os"])
+    st.markdown(f"**Trend signal record** (last ~{HISTORY_HOURS} hours, source: {rec['source']})")
+    _metric_row(rec["wins"], rec["losses"])
+    rows = rec["rows"]
+    ups, dns = rows[rows["signal"] == "UP"], rows[rows["signal"] == "DOWN"]
+    st.caption(
+        f"UP calls {int(ups['win'].sum())}–{len(ups) - int(ups['win'].sum())} · "
+        f"DOWN calls {int(dns['win'].sum())}–{len(dns) - int(dns['win'].sum())} · "
+        f"{rec['n_none']} of {rec['n_windows']} windows had no signal · "
+        + (f"for context, {rec['up_rate']:.0%} of those windows settled UP." if rec["n_windows"] else
+           "no graded windows yet."))
+    if rec["source"].startswith("Exchange") and not serr:
+        st.warning(f"Kalshi returned no settled {spec.series} markets, so this record is an est... (12 KB left)
+app.py
+62 KB
