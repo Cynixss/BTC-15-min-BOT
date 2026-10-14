@@ -183,4 +183,4 @@ def compute_indicators(raw: pd.DataFrame, lookback: int = 5) -> pd.DataFrame:
     close, vol = df["close"], df["volume"]
 
     # Trend: 9/21 EMA, spread, crossovers (+1 bullish, -1 bearish)
-    df["ema_9"], df["ema_21"] = _
+    df["ema_9"], df["ema_21"] =
